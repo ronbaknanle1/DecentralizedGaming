@@ -174,3 +174,288 @@
         })
     )
 )
+
+
+(define-map asset-rentals 
+    { asset-id: uint }
+    {
+        renter: principal,
+        rental-start: uint,
+        rental-end: uint,
+        rental-price: uint,
+        is-rented: bool
+    }
+)
+
+(define-data-var min-rental-period uint u1440)
+(define-data-var max-rental-period uint u43200)
+
+(define-public (list-asset-for-rent (asset-id uint) (rental-price uint) (duration uint))
+    (let ((asset (unwrap! (map-get? gaming-assets {asset-id: asset-id}) err-not-found)))
+        (asserts! (is-eq (get owner asset) tx-sender) err-not-authorized)
+        (asserts! (>= duration (var-get min-rental-period)) err-invalid-price)
+        (asserts! (<= duration (var-get max-rental-period)) err-invalid-price)
+        (ok (map-set asset-rentals
+            {asset-id: asset-id}
+            {
+                renter: tx-sender,
+                rental-start: u0,
+                rental-end: u0,
+                rental-price: rental-price,
+                is-rented: false
+            }
+        ))
+    )
+)
+
+(define-public (rent-asset (asset-id uint))
+    (let (
+        (rental (unwrap! (map-get? asset-rentals {asset-id: asset-id}) err-not-found))
+        (current-height stacks-block-height)
+        )
+        (asserts! (not (get is-rented rental)) err-already-listed)
+        (try! (stx-transfer? (get rental-price rental) tx-sender (get owner (unwrap! (map-get? gaming-assets {asset-id: asset-id}) err-not-found))))
+        (ok (map-set asset-rentals
+            {asset-id: asset-id}
+            (merge rental {
+                renter: tx-sender,
+                rental-start: current-height,
+                rental-end: (+ current-height (var-get min-rental-period)),
+                is-rented: true
+            })
+        ))
+    )
+)
+
+
+(define-map asset-bundles 
+    { bundle-id: uint }
+    {
+        owner: principal,
+        asset-ids: (list 5 uint),
+        bundle-price: uint,
+        active: bool
+    }
+)
+
+(define-data-var bundle-counter uint u0)
+
+(define-public (create-bundle (asset-ids (list 5 uint)) (bundle-price uint))
+    (let (
+        (bundle-id (+ (var-get bundle-counter) u1))
+        )
+        (var-set bundle-counter bundle-id)
+        (ok (map-set asset-bundles
+            {bundle-id: bundle-id}
+            {
+                owner: tx-sender,
+                asset-ids: asset-ids,
+                bundle-price: bundle-price,
+                active: true
+            }
+        ))
+    )
+)
+
+(define-public (purchase-bundle (bundle-id uint))
+    (let (
+        (bundle (unwrap! (map-get? asset-bundles {bundle-id: bundle-id}) err-not-found))
+        )
+        (asserts! (get active bundle) err-not-found)
+        (try! (stx-transfer? (get bundle-price bundle) tx-sender (get owner bundle)))
+        (ok (map-set asset-bundles
+            {bundle-id: bundle-id}
+            (merge bundle {active: false})
+        ))
+    )
+)
+
+
+(define-map asset-auctions
+    { asset-id: uint }
+    {
+        seller: principal,
+        current-bid: uint,
+        highest-bidder: (optional principal),
+        end-block: uint,
+        active: bool
+    }
+)
+
+(define-data-var min-auction-duration uint u1440)
+(define-constant min-bid-increase  u100)
+
+(define-public (start-auction (asset-id uint) (start-price uint) (duration uint))
+    (let (
+        (asset (unwrap! (map-get? gaming-assets {asset-id: asset-id}) err-not-found))
+        )
+        (asserts! (is-eq (get owner asset) tx-sender) err-not-authorized)
+        (asserts! (>= duration (var-get min-auction-duration)) err-invalid-price)
+        (ok (map-set asset-auctions
+            {asset-id: asset-id}
+            {
+                seller: tx-sender,
+                current-bid: start-price,
+                highest-bidder: none,
+                end-block: (+ stacks-block-height duration),
+                active: true
+            }
+        ))
+    )
+)
+
+(define-public (place-bid (asset-id uint) (bid-amount uint))
+    (let (
+        (auction (unwrap! (map-get? asset-auctions {asset-id: asset-id}) err-not-found))
+        )
+        (asserts! (get active auction) err-not-found)
+        (asserts! (<= stacks-block-height (get end-block auction)) err-not-authorized)
+        (asserts! (> bid-amount (+ (get current-bid auction) min-bid-increase)) err-invalid-price)
+        (try! (stx-transfer? bid-amount tx-sender (get seller auction)))
+        (ok (map-set asset-auctions
+            {asset-id: asset-id}
+            (merge auction {
+                current-bid: bid-amount,
+                highest-bidder: (some tx-sender)
+            })
+        ))
+    )
+)
+
+
+(define-map player-achievements
+    { user: principal }
+    {
+        trading-volume: uint,
+        assets-owned: uint,
+        tournament-wins: uint,
+        rank: (string-ascii 20)
+    }
+)
+
+(define-map achievement-rewards
+    { achievement-id: uint }
+    {
+        name: (string-ascii 50),
+        requirement: uint,
+        reward-amount: uint
+    }
+)
+
+(define-public (update-achievements (user principal))
+    (let (
+        (current-achievements (default-to 
+            {trading-volume: u0, assets-owned: u0, tournament-wins: u0, rank: "Novice"}
+            (map-get? player-achievements {user: user})))
+        )
+        (ok (map-set player-achievements
+            {user: user}
+            (merge current-achievements {
+                rank: (get-rank (get trading-volume current-achievements))
+            })
+        ))
+    )
+)
+
+(define-private (get-rank (volume uint))
+    (if (>= volume u1000000)
+        "Diamond"
+        (if (>= volume u100000)
+            "Gold"
+            (if (>= volume u10000)
+                "Silver"
+                "Bronze"
+            )
+        )
+    )
+)
+
+
+(define-map referral-system
+    { referrer: principal }
+    {
+        referred-users: (list 100 principal),
+        total-rewards: uint,
+        active-referrals: uint
+    }
+)
+
+(define-data-var referral-reward-percentage uint u50)
+
+(define-public (register-referral (referrer principal))
+    (let (
+        (current-data (default-to
+            {referred-users: (list), total-rewards: u0, active-referrals: u0}
+            (map-get? referral-system {referrer: referrer})))
+        )
+        (asserts! (not (is-eq tx-sender referrer)) err-not-authorized)
+        (ok (map-set referral-system
+            {referrer: referrer}
+            {
+                referred-users: (unwrap! (as-max-len? (append (get referred-users current-data) tx-sender) u100) err-not-authorized),
+                total-rewards: (get total-rewards current-data),
+                active-referrals: (+ (get active-referrals current-data) u1)
+            }
+        ))
+    )
+)
+
+(define-public (claim-referral-rewards (referrer principal))
+    (let (
+        (reward-data (unwrap! (map-get? referral-system {referrer: referrer}) err-not-found))
+        )
+        (ok (stx-transfer? (get total-rewards reward-data) contract-owner referrer))
+    )
+)
+
+
+(define-map verified-creators
+    { creator: principal }
+    {
+        verification-date: uint,
+        creator-name: (string-ascii 50),
+        total-verified-assets: uint
+    }
+)
+
+(define-map verification-requests
+    { asset-id: uint }
+    {
+        creator: principal,
+        submission-date: uint,
+        status: (string-ascii 20)
+    }
+)
+
+(define-public (request-asset-verification (asset-id uint))
+    (let (
+        (asset (unwrap! (map-get? gaming-assets {asset-id: asset-id}) err-not-found))
+        )
+        (asserts! (is-eq (get owner asset) tx-sender) err-not-authorized)
+        (ok (map-set verification-requests
+            {asset-id: asset-id}
+            {
+                creator: tx-sender,
+                submission-date: stacks-block-height,
+                status: "pending"
+            }
+        ))
+    )
+)
+
+(define-public (verify-asset (asset-id uint))
+    (let (
+        (request (unwrap! (map-get? verification-requests {asset-id: asset-id}) err-not-found))
+        )
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (map-set gaming-assets
+            {asset-id: asset-id}
+            (merge (unwrap! (map-get? gaming-assets {asset-id: asset-id}) err-not-found)
+                {verified: true})
+        )
+        (ok (map-set verification-requests
+            {asset-id: asset-id}
+            (merge request {status: "verified"})
+        ))
+    )
+)
