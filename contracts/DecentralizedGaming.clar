@@ -459,3 +459,144 @@
         ))
     )
 )
+
+
+(define-map asset-loans 
+    { asset-id: uint }
+    {
+        owner: principal,
+        borrower: (optional principal),
+        collateral-amount: uint,
+        loan-duration: uint,
+        loan-start: uint,
+        is-active: bool
+    }
+)
+
+(define-data-var min-collateral-ratio uint u150)
+(define-data-var max-loan-duration uint u4320)
+
+(define-public (create-loan-offer (asset-id uint) (collateral uint) (duration uint))
+    (let ((asset (unwrap! (map-get? gaming-assets {asset-id: asset-id}) err-not-found)))
+        (asserts! (is-eq (get owner asset) tx-sender) err-not-authorized)
+        (asserts! (<= duration (var-get max-loan-duration)) err-invalid-price)
+        (ok (map-set asset-loans
+            {asset-id: asset-id}
+            {
+                owner: tx-sender,
+                borrower: none,
+                collateral-amount: collateral,
+                loan-duration: duration,
+                loan-start: u0,
+                is-active: true
+            }
+        ))
+    )
+)
+
+(define-public (borrow-asset (asset-id uint))
+    (let (
+        (loan (unwrap! (map-get? asset-loans {asset-id: asset-id}) err-not-found))
+        (current-height stacks-block-height)
+        )
+        (asserts! (get is-active loan) err-not-found)
+        (asserts! (is-none (get borrower loan)) err-already-listed)
+        (try! (stx-transfer? (get collateral-amount loan) tx-sender (get owner loan)))
+        (ok (map-set asset-loans
+            {asset-id: asset-id}
+            (merge loan {
+                borrower: (some tx-sender),
+                loan-start: current-height
+            })
+        ))
+    )
+)
+
+
+
+(define-public (repay-loan (asset-id uint))
+    (let (
+        (loan (unwrap! (map-get? asset-loans {asset-id: asset-id}) err-not-found))
+        )
+        (asserts! (is-some (get borrower loan)) err-not-authorized)
+        (asserts! (< stacks-block-height (+ (get loan-start loan) (get loan-duration loan))) err-not-authorized)
+        (try! (stx-transfer? (get collateral-amount loan) tx-sender (get owner loan)))
+        (ok (map-set asset-loans
+            {asset-id: asset-id}
+            {
+                owner: tx-sender,
+                borrower: none,
+                collateral-amount: u0,
+                loan-duration: u0,
+                loan-start: u0,
+                is-active: false
+            }
+        ))
+    )
+)
+(define-public (cancel-loan-offer (asset-id uint))
+    (let (
+        (loan (unwrap! (map-get? asset-loans {asset-id: asset-id}) err-not-found))
+        )
+        (asserts! (is-eq tx-sender (get owner loan)) err-not-authorized)
+        (ok (map-set asset-loans
+            {asset-id: asset-id}
+            {
+                owner: tx-sender,
+                borrower: none,
+                collateral-amount: u0,
+                loan-duration: u0,
+                loan-start: u0,
+                is-active: false
+            }
+        ))
+    )
+)
+
+
+(define-map staked-assets
+    { asset-id: uint }
+    {
+        staker: principal,
+        stake-start: uint,
+        stake-duration: uint,
+        rewards-claimed: uint,
+        is-staked: bool
+    }
+)
+
+(define-data-var reward-rate uint u100)
+(define-data-var min-stake-duration uint u1440)
+
+(define-public (stake-asset (asset-id uint) (duration uint))
+    (let ((asset (unwrap! (map-get? gaming-assets {asset-id: asset-id}) err-not-found)))
+        (asserts! (is-eq (get owner asset) tx-sender) err-not-authorized)
+        (asserts! (>= duration (var-get min-stake-duration)) err-invalid-price)
+        (ok (map-set staked-assets
+            {asset-id: asset-id}
+            {
+                staker: tx-sender,
+                stake-start: stacks-block-height,
+                stake-duration: duration,
+                rewards-claimed: u0,
+                is-staked: true
+            }
+        ))
+    )
+)
+
+(define-public (claim-staking-rewards (asset-id uint))
+    (let (
+        (stake-info (unwrap! (map-get? staked-assets {asset-id: asset-id}) err-not-found))
+        (elapsed-blocks (- stacks-block-height (get stake-start stake-info)))
+        (reward-amount (* elapsed-blocks (var-get reward-rate)))
+        )
+        (asserts! (get is-staked stake-info) err-not-found)
+        (asserts! (is-eq (get staker stake-info) tx-sender) err-not-authorized)
+        (try! (stx-transfer? reward-amount contract-owner tx-sender))
+        (ok (map-set staked-assets
+            {asset-id: asset-id}
+            (merge stake-info {rewards-claimed: (+ (get rewards-claimed stake-info) reward-amount)})
+        ))
+    )
+)
