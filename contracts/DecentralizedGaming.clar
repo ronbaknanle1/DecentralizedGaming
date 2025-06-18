@@ -10,6 +10,48 @@
 (define-constant err-not-authorized (err u104))
 (define-constant err-invalid-price (err u105))
 
+
+(define-map asset-price-history
+    { asset-id: uint }
+    {
+        base-price: uint,
+        current-multiplier: uint,
+        last-sale-block: uint,
+        total-views: uint,
+        failed-purchases: uint,
+        successful-sales: uint
+    }
+)
+
+(define-map market-demand-metrics
+    { asset-id: uint }
+    {
+        view-count-24h: uint,
+        purchase-attempts-24h: uint,
+        last-metric-reset: uint,
+        demand-score: uint
+    }
+)
+
+(define-map price-adjustment-rules
+    { rule-id: uint }
+    {
+        min-multiplier: uint,
+        max-multiplier: uint,
+        adjustment-rate: uint,
+        cooldown-period: uint
+    }
+)
+
+(define-data-var price-engine-enabled bool true)
+(define-data-var base-multiplier uint u1000)
+(define-data-var max-price-increase uint u2000)
+(define-data-var min-price-decrease uint u500)
+(define-data-var demand-threshold-high uint u10)
+(define-data-var demand-threshold-low uint u2)
+(define-data-var price-adjustment-cooldown uint u144)
+
+
 ;; Data Variables
 (define-data-var platform-fee uint u25) ;; 2.5% fee
 (define-data-var tournament-entry-fee uint u100)
@@ -534,6 +576,26 @@
         ))
     )
 )
+
+(define-public (unstake-asset (asset-id uint))
+    (let (
+        (stake-info (unwrap! (map-get? staked-assets {asset-id: asset-id}) err-not-found))
+        )
+        (asserts! (get is-staked stake-info) err-not-found)
+        (asserts! (is-eq (get staker stake-info) tx-sender) err-not-authorized)
+        (ok (map-set staked-assets
+            {asset-id: asset-id}
+            {
+                staker: tx-sender,
+                stake-start: u0,
+                stake-duration: u0,
+                rewards-claimed: u0,
+                is-staked: false
+            }
+        ))
+    )
+)
+
 (define-public (cancel-loan-offer (asset-id uint))
     (let (
         (loan (unwrap! (map-get? asset-loans {asset-id: asset-id}) err-not-found))
@@ -598,5 +660,230 @@
             {asset-id: asset-id}
             (merge stake-info {rewards-claimed: (+ (get rewards-claimed stake-info) reward-amount)})
         ))
+    )
+)
+
+
+(define-public (initialize-asset-pricing (asset-id uint) (base-price uint))
+    (let ((asset (unwrap! (map-get? gaming-assets {asset-id: asset-id}) err-not-found)))
+        (asserts! (is-eq (get owner asset) tx-sender) err-not-authorized)
+        (asserts! (> base-price u0) err-invalid-price)
+        (map-set asset-price-history
+            {asset-id: asset-id}
+            {
+                base-price: base-price,
+                current-multiplier: (var-get base-multiplier),
+                last-sale-block: stacks-block-height,
+                total-views: u0,
+                failed-purchases: u0,
+                successful-sales: u0
+            }
+        )
+        (ok (map-set market-demand-metrics
+            {asset-id: asset-id}
+            {
+                view-count-24h: u0,
+                purchase-attempts-24h: u0,
+                last-metric-reset: stacks-block-height,
+                demand-score: u0
+            }
+        ))
+    )
+)
+
+(define-public (record-asset-view (asset-id uint))
+    (let (
+        (current-metrics (default-to
+            {view-count-24h: u0, purchase-attempts-24h: u0, last-metric-reset: stacks-block-height, demand-score: u0}
+            (map-get? market-demand-metrics {asset-id: asset-id})))
+        (price-history (unwrap! (map-get? asset-price-history {asset-id: asset-id}) err-not-found))
+        )
+        (map-set asset-price-history
+            {asset-id: asset-id}
+            (merge price-history {total-views: (+ (get total-views price-history) u1)})
+        )
+        (ok (map-set market-demand-metrics
+            {asset-id: asset-id}
+            (merge current-metrics {view-count-24h: (+ (get view-count-24h current-metrics) u1)})
+        ))
+    )
+)
+
+(define-public (calculate-dynamic-price (asset-id uint))
+    (let (
+        (price-history (unwrap! (map-get? asset-price-history {asset-id: asset-id}) err-not-found))
+        (demand-metrics (unwrap! (map-get? market-demand-metrics {asset-id: asset-id}) err-not-found))
+        (demand-score (calculate-demand-score asset-id))
+        (new-multiplier (calculate-price-multiplier demand-score))
+        (adjusted-price (/ (* (get base-price price-history) new-multiplier) u1000))
+        )
+        (asserts! (var-get price-engine-enabled) err-not-authorized)
+        (map-set asset-price-history
+            {asset-id: asset-id}
+            (merge price-history {current-multiplier: new-multiplier})
+        )
+        (ok adjusted-price)
+    )
+)
+
+(define-public (update-asset-price-on-sale (asset-id uint) (sale-successful bool))
+    (let (
+        (price-history (unwrap! (map-get? asset-price-history {asset-id: asset-id}) err-not-found))
+        (demand-metrics (unwrap! (map-get? market-demand-metrics {asset-id: asset-id}) err-not-found))
+        )
+        (if sale-successful
+            (begin
+                (map-set asset-price-history
+                    {asset-id: asset-id}
+                    (merge price-history {
+                        successful-sales: (+ (get successful-sales price-history) u1),
+                        last-sale-block: stacks-block-height
+                    })
+                )
+                (ok true)
+            )
+            (begin
+                (map-set asset-price-history
+                    {asset-id: asset-id}
+                    (merge price-history {failed-purchases: (+ (get failed-purchases price-history) u1)})
+                )
+                (map-set market-demand-metrics
+                    {asset-id: asset-id}
+                    (merge demand-metrics {purchase-attempts-24h: (+ (get purchase-attempts-24h demand-metrics) u1)})
+                )
+                (ok false)
+            )
+        )
+    )
+)
+
+(define-public (reset-daily-metrics (asset-id uint))
+    (let (
+        (current-metrics (unwrap! (map-get? market-demand-metrics {asset-id: asset-id}) err-not-found))
+        (blocks-since-reset (- stacks-block-height (get last-metric-reset current-metrics)))
+        )
+        (asserts! (>= blocks-since-reset u1440) err-not-authorized)
+        (ok (map-set market-demand-metrics
+            {asset-id: asset-id}
+            {
+                view-count-24h: u0,
+                purchase-attempts-24h: u0,
+                last-metric-reset: stacks-block-height,
+                demand-score: (calculate-demand-score asset-id)
+            }
+        ))
+    )
+)
+
+(define-public (set-price-adjustment-rule (rule-id uint) (min-mult uint) (max-mult uint) (adj-rate uint) (cooldown uint))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (ok (map-set price-adjustment-rules
+            {rule-id: rule-id}
+            {
+                min-multiplier: min-mult,
+                max-multiplier: max-mult,
+                adjustment-rate: adj-rate,
+                cooldown-period: cooldown
+            }
+        ))
+    )
+)
+
+(define-read-only (get-current-market-price (asset-id uint))
+    (let (
+        (price-history (map-get? asset-price-history {asset-id: asset-id}))
+        )
+        (match price-history
+            history (some (/ (* (get base-price history) (get current-multiplier history)) u1000))
+            none
+        )
+    )
+)
+
+(define-read-only (get-asset-demand-metrics (asset-id uint))
+    (map-get? market-demand-metrics {asset-id: asset-id})
+)
+
+(define-read-only (get-price-trend (asset-id uint))
+    (let (
+        (price-history (map-get? asset-price-history {asset-id: asset-id}))
+        )
+        (match price-history
+            history (let (
+                (current-mult (get current-multiplier history))
+                (base-mult (var-get base-multiplier))
+                )
+                (if (> current-mult base-mult)
+                    "increasing"
+                    (if (< current-mult base-mult)
+                        "decreasing"
+                        "stable"
+                    )
+                )
+            )
+            "unknown"
+        )
+    )
+)
+
+(define-private (calculate-demand-score (asset-id uint))
+    (let (
+        (metrics (default-to
+            {view-count-24h: u0, purchase-attempts-24h: u0, last-metric-reset: stacks-block-height, demand-score: u0}
+            (map-get? market-demand-metrics {asset-id: asset-id})))
+        (price-history (default-to
+            {base-price: u0, current-multiplier: u1000, last-sale-block: stacks-block-height, total-views: u0, failed-purchases: u0, successful-sales: u0}
+            (map-get? asset-price-history {asset-id: asset-id})))
+        (view-weight u3)
+        (attempt-weight u5)
+        (success-weight u10)
+        )
+        (+
+            (* (get view-count-24h metrics) view-weight)
+            (* (get purchase-attempts-24h metrics) attempt-weight)
+            (* (get successful-sales price-history) success-weight)
+        )
+    )
+)
+
+(define-private (min (a uint) (b uint))
+    (if (< a b) a b)
+)
+
+(define-private (max (a uint) (b uint))
+    (if (> a b) a b)
+)
+
+(define-private (calculate-price-multiplier (demand-score uint))
+    (let (
+        (base-mult (var-get base-multiplier))
+        (high-threshold (var-get demand-threshold-high))
+        (low-threshold (var-get demand-threshold-low))
+        )
+        (if (>= demand-score high-threshold)
+            (min (var-get max-price-increase) (+ base-mult (* (- demand-score high-threshold) u50)))
+            (if (<= demand-score low-threshold)
+                (max (var-get min-price-decrease) (- base-mult (* (- low-threshold demand-score) u25)))
+                base-mult
+            )
+        )
+    )
+)
+
+(define-public (enable-price-engine (enabled bool))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (ok (var-set price-engine-enabled enabled))
+    )
+)
+
+(define-public (update-price-parameters (new-base-multiplier uint) (new-max-increase uint) (new-min-decrease uint))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (var-set base-multiplier new-base-multiplier)
+        (var-set max-price-increase new-max-increase)
+        (var-set min-price-decrease new-min-decrease)
+        (ok true)
     )
 )
