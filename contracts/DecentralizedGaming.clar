@@ -887,3 +887,186 @@
         (ok true)
     )
 )
+
+(define-map asset-escrows
+    { escrow-id: uint }
+    {
+        buyer: principal,
+        seller: principal,
+        asset-id: uint,
+        escrow-amount: uint,
+        arbitrator: (optional principal),
+        created-at: uint,
+        expires-at: uint,
+        status: (string-ascii 20),
+        buyer-confirmed: bool,
+        seller-confirmed: bool,
+        funds-deposited: bool
+    }
+)
+
+(define-data-var escrow-counter uint u0)
+(define-data-var escrow-timeout-blocks uint u2016)
+(define-data-var arbitration-fee uint u500)
+
+(define-public (create-escrow (buyer principal) (seller principal) (asset-id uint) (amount uint) (arbitrator (optional principal)))
+    (let (
+        (escrow-id (+ (var-get escrow-counter) u1))
+        (current-block stacks-block-height)
+        (expiry-block (+ current-block (var-get escrow-timeout-blocks)))
+        )
+        (asserts! (> amount u0) err-invalid-price)
+        (asserts! (not (is-eq buyer seller)) err-not-authorized)
+        (var-set escrow-counter escrow-id)
+        (ok (map-set asset-escrows
+            {escrow-id: escrow-id}
+            {
+                buyer: buyer,
+                seller: seller,
+                asset-id: asset-id,
+                escrow-amount: amount,
+                arbitrator: arbitrator,
+                created-at: current-block,
+                expires-at: expiry-block,
+                status: "pending",
+                buyer-confirmed: false,
+                seller-confirmed: false,
+                funds-deposited: false
+            }
+        ))
+    )
+)
+
+(define-public (deposit-escrow-funds (escrow-id uint))
+    (let (
+        (escrow (unwrap! (map-get? asset-escrows {escrow-id: escrow-id}) err-not-found))
+        )
+        (asserts! (is-eq tx-sender (get buyer escrow)) err-not-authorized)
+        (asserts! (is-eq (get status escrow) "pending") err-not-authorized)
+        (asserts! (not (get funds-deposited escrow)) err-already-listed)
+        (asserts! (< stacks-block-height (get expires-at escrow)) err-not-authorized)
+        (try! (stx-transfer? (get escrow-amount escrow) tx-sender (as-contract tx-sender)))
+        (ok (map-set asset-escrows
+            {escrow-id: escrow-id}
+            (merge escrow {
+                funds-deposited: true,
+                status: "funded"
+            })
+        ))
+    )
+)
+
+(define-public (confirm-escrow-terms (escrow-id uint))
+    (let (
+        (escrow (unwrap! (map-get? asset-escrows {escrow-id: escrow-id}) err-not-found))
+        (is-buyer (is-eq tx-sender (get buyer escrow)))
+        (is-seller (is-eq tx-sender (get seller escrow)))
+        )
+        (asserts! (or is-buyer is-seller) err-not-authorized)
+        (asserts! (is-eq (get status escrow) "funded") err-not-authorized)
+        (asserts! (< stacks-block-height (get expires-at escrow)) err-not-authorized)
+        (if is-buyer
+            (ok (map-set asset-escrows
+                {escrow-id: escrow-id}
+                (merge escrow {buyer-confirmed: true})
+            ))
+            (ok (map-set asset-escrows
+                {escrow-id: escrow-id}
+                (merge escrow {seller-confirmed: true})
+            ))
+        )
+    )
+)
+
+(define-public (complete-escrow (escrow-id uint))
+    (let (
+        (escrow (unwrap! (map-get? asset-escrows {escrow-id: escrow-id}) err-not-found))
+        (asset (unwrap! (map-get? gaming-assets {asset-id: (get asset-id escrow)}) err-not-found))
+        )
+        (asserts! (is-eq (get status escrow) "funded") err-not-authorized)
+        (asserts! (get buyer-confirmed escrow) err-not-authorized)
+        (asserts! (get seller-confirmed escrow) err-not-authorized)
+        (asserts! (get funds-deposited escrow) err-not-authorized)
+        (asserts! (is-eq (get owner asset) (get seller escrow)) err-not-authorized)
+        (try! (as-contract (stx-transfer? (get escrow-amount escrow) tx-sender (get seller escrow))))
+        (map-set gaming-assets
+            {asset-id: (get asset-id escrow)}
+            (merge asset {owner: (get buyer escrow), listed: false})
+        )
+        (ok (map-set asset-escrows
+            {escrow-id: escrow-id}
+            (merge escrow {status: "completed"})
+        ))
+    )
+)
+
+(define-public (cancel-escrow (escrow-id uint))
+    (let (
+        (escrow (unwrap! (map-get? asset-escrows {escrow-id: escrow-id}) err-not-found))
+        (is-buyer (is-eq tx-sender (get buyer escrow)))
+        (is-seller (is-eq tx-sender (get seller escrow)))
+        (is-expired (>= stacks-block-height (get expires-at escrow)))
+        )
+        (asserts! (or is-buyer is-seller is-expired) err-not-authorized)
+        (asserts! (not (is-eq (get status escrow) "completed")) err-not-authorized)
+        (asserts! (not (is-eq (get status escrow) "disputed")) err-not-authorized)
+        (if (get funds-deposited escrow)
+            (try! (as-contract (stx-transfer? (get escrow-amount escrow) tx-sender (get buyer escrow))))
+            true
+        )
+        (ok (map-set asset-escrows
+            {escrow-id: escrow-id}
+            (merge escrow {status: "cancelled"})
+        ))
+    )
+)
+
+(define-public (initiate-dispute (escrow-id uint))
+    (let (
+        (escrow (unwrap! (map-get? asset-escrows {escrow-id: escrow-id}) err-not-found))
+        (is-buyer (is-eq tx-sender (get buyer escrow)))
+        (is-seller (is-eq tx-sender (get seller escrow)))
+        )
+        (asserts! (or is-buyer is-seller) err-not-authorized)
+        (asserts! (is-eq (get status escrow) "funded") err-not-authorized)
+        (asserts! (is-some (get arbitrator escrow)) err-not-found)
+        (asserts! (get funds-deposited escrow) err-not-authorized)
+        (try! (stx-transfer? (var-get arbitration-fee) tx-sender (unwrap! (get arbitrator escrow) err-not-found)))
+        (ok (map-set asset-escrows
+            {escrow-id: escrow-id}
+            (merge escrow {status: "disputed"})
+        ))
+    )
+)
+
+(define-public (resolve-dispute (escrow-id uint) (award-to-buyer bool))
+    (let (
+        (escrow (unwrap! (map-get? asset-escrows {escrow-id: escrow-id}) err-not-found))
+        (arbitrator-addr (unwrap! (get arbitrator escrow) err-not-found))
+        )
+        (asserts! (is-eq tx-sender arbitrator-addr) err-not-authorized)
+        (asserts! (is-eq (get status escrow) "disputed") err-not-authorized)
+        (asserts! (get funds-deposited escrow) err-not-authorized)
+        (if award-to-buyer
+            (try! (as-contract (stx-transfer? (get escrow-amount escrow) tx-sender (get buyer escrow))))
+            (try! (as-contract (stx-transfer? (get escrow-amount escrow) tx-sender (get seller escrow))))
+        )
+        (ok (map-set asset-escrows
+            {escrow-id: escrow-id}
+            (merge escrow {status: "resolved"})
+        ))
+    )
+)
+
+(define-read-only (get-escrow (escrow-id uint))
+    (map-get? asset-escrows {escrow-id: escrow-id})
+)
+
+(define-read-only (get-escrow-status (escrow-id uint))
+    (let ((escrow (map-get? asset-escrows {escrow-id: escrow-id})))
+        (match escrow
+            esc (get status esc)
+            "not-found"
+        )
+    )
+)
