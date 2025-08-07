@@ -1070,3 +1070,348 @@
         )
     )
 )
+
+;; Guild Management System - Collaborative gaming organizations
+
+(define-map guilds
+    { guild-id: uint }
+    {
+        name: (string-ascii 50),
+        founder: principal,
+        description: (string-ascii 200),
+        treasury-balance: uint,
+        member-count: uint,
+        max-members: uint,
+        creation-block: uint,
+        is-active: bool,
+        entry-fee: uint,
+        guild-tag: (string-ascii 10)
+    }
+)
+
+(define-map guild-members
+    { guild-id: uint, member: principal }
+    {
+        role: (string-ascii 20),
+        join-date: uint,
+        contribution-score: uint,
+        permissions: uint,
+        is-active: bool,
+        assets-shared: uint,
+        voting-power: uint
+    }
+)
+
+(define-map guild-assets
+    { guild-id: uint, asset-id: uint }
+    {
+        owner: principal,
+        shared-date: uint,
+        usage-count: uint,
+        access-level: uint,
+        is-available: bool
+    }
+)
+
+(define-map guild-proposals
+    { guild-id: uint, proposal-id: uint }
+    {
+        proposer: principal,
+        title: (string-ascii 100),
+        description: (string-ascii 300),
+        proposal-type: (string-ascii 30),
+        target-member: (optional principal),
+        target-amount: uint,
+        votes-for: uint,
+        votes-against: uint,
+        voting-deadline: uint,
+        is-executed: bool,
+        is-active: bool
+    }
+)
+
+(define-map member-votes
+    { guild-id: uint, proposal-id: uint, voter: principal }
+    {
+        vote-choice: bool,
+        vote-weight: uint,
+        vote-timestamp: uint
+    }
+)
+
+;; Guild system variables
+(define-data-var guild-counter uint u0)
+(define-data-var max-guild-members uint u50)
+(define-data-var min-guild-entry-fee uint u100)
+(define-data-var proposal-voting-period uint u1008) ;; ~7 days in blocks
+(define-data-var guild-creation-fee uint u1000)
+
+;; Permission levels for guild roles
+(define-constant PERMISSION-VIEW u1)
+(define-constant PERMISSION-USE-ASSETS u2)
+(define-constant PERMISSION-INVITE u4)
+(define-constant PERMISSION-KICK u8)
+(define-constant PERMISSION-TREASURY u16)
+(define-constant PERMISSION-ADMIN u32)
+
+;; Role definitions
+(define-constant ROLE-MEMBER "Member")
+(define-constant ROLE-OFFICER "Officer")
+(define-constant ROLE-LEADER "Leader")
+(define-constant ROLE-FOUNDER "Founder")
+
+(define-public (create-guild (name (string-ascii 50)) (description (string-ascii 200)) (tag (string-ascii 10)) (entry-fee uint) (max-members uint))
+    (let (
+        (guild-id (+ (var-get guild-counter) u1))
+        (current-block stacks-block-height)
+        )
+        (asserts! (>= entry-fee (var-get min-guild-entry-fee)) err-invalid-price)
+        (asserts! (<= max-members (var-get max-guild-members)) err-invalid-price)
+        (asserts! (> (len name) u0) err-invalid-price)
+        (try! (stx-transfer? (var-get guild-creation-fee) tx-sender contract-owner))
+        (var-set guild-counter guild-id)
+        ;; Create guild record
+        (map-set guilds
+            {guild-id: guild-id}
+            {
+                name: name,
+                founder: tx-sender,
+                description: description,
+                treasury-balance: u0,
+                member-count: u1,
+                max-members: max-members,
+                creation-block: current-block,
+                is-active: true,
+                entry-fee: entry-fee,
+                guild-tag: tag
+            }
+        )
+        ;; Add founder as first member
+        (map-set guild-members
+            {guild-id: guild-id, member: tx-sender}
+            {
+                role: ROLE-FOUNDER,
+                join-date: current-block,
+                contribution-score: u100,
+                permissions: u63, ;; All permissions
+                is-active: true,
+                assets-shared: u0,
+                voting-power: u10
+            }
+        )
+        (ok guild-id)
+    )
+)
+
+(define-public (join-guild (guild-id uint))
+    (let (
+        (guild (unwrap! (map-get? guilds {guild-id: guild-id}) err-not-found))
+        (current-block stacks-block-height)
+        )
+        (asserts! (get is-active guild) err-not-authorized)
+        (asserts! (< (get member-count guild) (get max-members guild)) err-not-authorized)
+        (asserts! (is-none (map-get? guild-members {guild-id: guild-id, member: tx-sender})) err-already-listed)
+        (try! (stx-transfer? (get entry-fee guild) tx-sender (as-contract tx-sender)))
+        ;; Add member to guild
+        (map-set guild-members
+            {guild-id: guild-id, member: tx-sender}
+            {
+                role: ROLE-MEMBER,
+                join-date: current-block,
+                contribution-score: u0,
+                permissions: (+ PERMISSION-VIEW PERMISSION-USE-ASSETS),
+                is-active: true,
+                assets-shared: u0,
+                voting-power: u1
+            }
+        )
+        ;; Update guild stats and treasury
+        (map-set guilds
+            {guild-id: guild-id}
+            (merge guild {
+                member-count: (+ (get member-count guild) u1),
+                treasury-balance: (+ (get treasury-balance guild) (get entry-fee guild))
+            })
+        )
+        (ok true)
+    )
+)
+
+(define-public (share-asset-with-guild (guild-id uint) (asset-id uint) (access-level uint))
+    (let (
+        (guild (unwrap! (map-get? guilds {guild-id: guild-id}) err-not-found))
+        (member (unwrap! (map-get? guild-members {guild-id: guild-id, member: tx-sender}) err-not-authorized))
+        (asset (unwrap! (map-get? gaming-assets {asset-id: asset-id}) err-not-found))
+        )
+        (asserts! (get is-active member) err-not-authorized)
+        (asserts! (is-eq (get owner asset) tx-sender) err-not-authorized)
+        (asserts! (<= access-level u3) err-invalid-price) ;; Max access level
+        ;; Record shared asset
+        (map-set guild-assets
+            {guild-id: guild-id, asset-id: asset-id}
+            {
+                owner: tx-sender,
+                shared-date: stacks-block-height,
+                usage-count: u0,
+                access-level: access-level,
+                is-available: true
+            }
+        )
+        ;; Update member contribution
+        (map-set guild-members
+            {guild-id: guild-id, member: tx-sender}
+            (merge member {
+                assets-shared: (+ (get assets-shared member) u1),
+                contribution-score: (+ (get contribution-score member) u25)
+            })
+        )
+        (ok true)
+    )
+)
+
+(define-public (use-guild-asset (guild-id uint) (asset-id uint))
+    (let (
+        (member (unwrap! (map-get? guild-members {guild-id: guild-id, member: tx-sender}) err-not-authorized))
+        (guild-asset (unwrap! (map-get? guild-assets {guild-id: guild-id, asset-id: asset-id}) err-not-found))
+        )
+        (asserts! (get is-active member) err-not-authorized)
+        (asserts! (get is-available guild-asset) err-not-authorized)
+        (asserts! (>= (get permissions member) PERMISSION-USE-ASSETS) err-not-authorized)
+        ;; Update usage stats
+        (map-set guild-assets
+            {guild-id: guild-id, asset-id: asset-id}
+            (merge guild-asset {usage-count: (+ (get usage-count guild-asset) u1)})
+        )
+        ;; Update user contribution
+        (map-set guild-members
+            {guild-id: guild-id, member: tx-sender}
+            (merge member {contribution-score: (+ (get contribution-score member) u5)})
+        )
+        (ok true)
+    )
+)
+
+(define-public (promote-member (guild-id uint) (target-member principal) (new-role (string-ascii 20)) (new-permissions uint))
+    (let (
+        (promoter (unwrap! (map-get? guild-members {guild-id: guild-id, member: tx-sender}) err-not-authorized))
+        (target (unwrap! (map-get? guild-members {guild-id: guild-id, member: target-member}) err-not-found))
+        )
+        (asserts! (get is-active promoter) err-not-authorized)
+        (asserts! (get is-active target) err-not-authorized)
+        (asserts! (>= (get permissions promoter) PERMISSION-ADMIN) err-not-authorized)
+        (asserts! (<= new-permissions u63) err-invalid-price)
+        ;; Update member role and permissions
+        (map-set guild-members
+            {guild-id: guild-id, member: target-member}
+            (merge target {
+                role: new-role,
+                permissions: new-permissions,
+                voting-power: (if (>= new-permissions PERMISSION-ADMIN) u5 u1)
+            })
+        )
+        (ok true)
+    )
+)
+
+(define-public (create-guild-proposal (guild-id uint) (title (string-ascii 100)) (description (string-ascii 300)) (proposal-type (string-ascii 30)) (target-member (optional principal)) (target-amount uint))
+    (let (
+        (member (unwrap! (map-get? guild-members {guild-id: guild-id, member: tx-sender}) err-not-authorized))
+        (guild (unwrap! (map-get? guilds {guild-id: guild-id}) err-not-found))
+        (proposal-id (+ (get member-count guild) stacks-block-height)) ;; Simple ID generation
+        )
+        (asserts! (get is-active member) err-not-authorized)
+        (asserts! (>= (get permissions member) PERMISSION-VIEW) err-not-authorized)
+        ;; Create proposal
+        (map-set guild-proposals
+            {guild-id: guild-id, proposal-id: proposal-id}
+            {
+                proposer: tx-sender,
+                title: title,
+                description: description,
+                proposal-type: proposal-type,
+                target-member: target-member,
+                target-amount: target-amount,
+                votes-for: u0,
+                votes-against: u0,
+                voting-deadline: (+ stacks-block-height (var-get proposal-voting-period)),
+                is-executed: false,
+                is-active: true
+            }
+        )
+        (ok proposal-id)
+    )
+)
+
+(define-public (vote-on-proposal (guild-id uint) (proposal-id uint) (vote-for bool))
+    (let (
+        (member (unwrap! (map-get? guild-members {guild-id: guild-id, member: tx-sender}) err-not-authorized))
+        (proposal (unwrap! (map-get? guild-proposals {guild-id: guild-id, proposal-id: proposal-id}) err-not-found))
+        (vote-weight (get voting-power member))
+        )
+        (asserts! (get is-active member) err-not-authorized)
+        (asserts! (get is-active proposal) err-not-authorized)
+        (asserts! (< stacks-block-height (get voting-deadline proposal)) err-not-authorized)
+        (asserts! (is-none (map-get? member-votes {guild-id: guild-id, proposal-id: proposal-id, voter: tx-sender})) err-already-listed)
+        ;; Record vote
+        (map-set member-votes
+            {guild-id: guild-id, proposal-id: proposal-id, voter: tx-sender}
+            {
+                vote-choice: vote-for,
+                vote-weight: vote-weight,
+                vote-timestamp: stacks-block-height
+            }
+        )
+        ;; Update proposal vote counts
+        (if vote-for
+            (map-set guild-proposals
+                {guild-id: guild-id, proposal-id: proposal-id}
+                (merge proposal {votes-for: (+ (get votes-for proposal) vote-weight)})
+            )
+            (map-set guild-proposals
+                {guild-id: guild-id, proposal-id: proposal-id}
+                (merge proposal {votes-against: (+ (get votes-against proposal) vote-weight)})
+            )
+        )
+        (ok true)
+    )
+)
+
+(define-public (contribute-to-treasury (guild-id uint) (amount uint))
+    (let (
+        (member (unwrap! (map-get? guild-members {guild-id: guild-id, member: tx-sender}) err-not-authorized))
+        (guild (unwrap! (map-get? guilds {guild-id: guild-id}) err-not-found))
+        )
+        (asserts! (get is-active member) err-not-authorized)
+        (asserts! (> amount u0) err-invalid-price)
+        (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+        ;; Update guild treasury
+        (map-set guilds
+            {guild-id: guild-id}
+            (merge guild {treasury-balance: (+ (get treasury-balance guild) amount)})
+        )
+        ;; Update member contribution score
+        (map-set guild-members
+            {guild-id: guild-id, member: tx-sender}
+            (merge member {contribution-score: (+ (get contribution-score member) (/ amount u10))})
+        )
+        (ok true)
+    )
+)
+
+;; Read-only functions for guild information
+(define-read-only (get-guild-info (guild-id uint))
+    (map-get? guilds {guild-id: guild-id})
+)
+
+(define-read-only (get-guild-member (guild-id uint) (member principal))
+    (map-get? guild-members {guild-id: guild-id, member: member})
+)
+
+(define-read-only (get-guild-asset (guild-id uint) (asset-id uint))
+    (map-get? guild-assets {guild-id: guild-id, asset-id: asset-id})
+)
+
+(define-read-only (get-guild-proposal (guild-id uint) (proposal-id uint))
+    (map-get? guild-proposals {guild-id: guild-id, proposal-id: proposal-id})
+)
+
