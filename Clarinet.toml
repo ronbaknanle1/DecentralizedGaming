@@ -9,6 +9,15 @@ requirements = []
 path = 'contracts/DecentralizedGaming.clar'
 clarity_version = 3
 epoch = 3.1
+[contracts.tournament-brackets]
+path = 'contracts/tournament-brackets.clar'
+clarity_version = 3
+epoch = 3.1
+
+[contracts.player-ratings]
+path = 'contracts/player-ratings.clar'
+clarity_version = 3
+epoch = 3.1
 [repl.analysis]
 passes = ['check_checker']
 
