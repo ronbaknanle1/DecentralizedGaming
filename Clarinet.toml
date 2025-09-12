@@ -1,0 +1,33 @@
+[project]
+name = 'DecentralizedGaming'
+description = ''
+authors = []
+telemetry = true
+cache_dir = '.\.cache'
+requirements = []
+[contracts.DecentralizedGaming]
+path = 'contracts/DecentralizedGaming.clar'
+clarity_version = 3
+epoch = 3.1
+[contracts.tournament-brackets]
+path = 'contracts/tournament-brackets.clar'
+clarity_version = 3
+epoch = 3.1
+
+[contracts.player-ratings]
+path = 'contracts/player-ratings.clar'
+clarity_version = 3
+epoch = 3.1
+
+[contracts.asset-pools]
+path = 'contracts/asset-pools.clar'
+clarity_version = 3
+epoch = 3.1
+[repl.analysis]
+passes = ['check_checker']
+
+[repl.analysis.check_checker]
+strict = false
+trusted_sender = false
+trusted_caller = false
+callee_filter = false
